@@ -1,0 +1,720 @@
+require('dotenv').config();
+const express = require('express');
+const morgan = require('morgan');
+const cors = require('cors');
+const path = require('path');
+const bodyParser = require('body-parser');
+
+const connectDB = require('./config/db');
+const authRoutes = require('./routes/authRoutes');
+const complaintRoutes = require('./routes/complaintRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const chatbotRoutes = require('./routes/chatbotRoutes');
+const { errorHandler, notFound } = require('./middlewares/errorMiddleware');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+connectDB();
+
+// Middlewares
+app.use(cors());
+app.use(morgan('dev'));
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true }));
+// serve uploaded images
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/complaints', complaintRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/chatbot', chatbotRoutes);
+
+// health
+app.get('/api/health', (req, res) => res.json({ ok: true, timestamp: Date.now() }));
+
+// error handlers
+app.use(notFound);
+app.use(errorHandler);
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+
+const mongoose = require('mongoose');
+
+const connectDB = async () => {
+  try {
+    const uri = process.env.MONGODB_URI;
+    if (!uri) throw new Error('MONGODB_URI not set in .env');
+    await mongoose.connect(uri, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+    console.log('MongoDB connected');
+  } catch (err) {
+    console.error('MongoDB connection error:', err.message);
+    process.exit(1);
+  }
+};
+
+module.exports = connectDB;
+
+
+
+const Complaint = require('../models/Complaint');
+const User = require('../models/User');
+const { notifyUser } = require('../utils/notifier');
+
+/**
+ * Admin: list complaints (with filters)
+ */
+exports.listComplaints = async (req, res, next) => {
+  try {
+    const { status, category, assignedTo, page = 1, limit = 50 } = req.query;
+    const q = {};
+    if (status) q.status = status;
+    if (category) q.category = category;
+    if (assignedTo) q.assignedTo = assignedTo;
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const complaints = await Complaint.find(q).populate('createdBy', 'name email').populate('assignedTo', 'name email').sort({ createdAt: -1 }).skip(skip).limit(Number(limit));
+    res.json({ complaints });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.updateComplaintStatus = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status, resolutionNotes, resolutionPhotos } = req.body;
+    if (!['Pending', 'In Progress', 'Resolved', 'Rejected'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+    const complaint = await Complaint.findById(id);
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
+
+    complaint.status = status;
+    if (resolutionNotes) complaint.resolutionNotes = resolutionNotes;
+    if (resolutionPhotos && Array.isArray(resolutionPhotos)) complaint.resolutionPhotos = complaint.resolutionPhotos.concat(resolutionPhotos);
+    await complaint.save();
+
+    // Notify complaint creator
+    await notifyUser(complaint.createdBy, {
+      title: `Complaint "${complaint.title}" status updated`,
+      message: `Status changed to ${status}.`,
+      html: `<p>Your complaint <strong>${complaint.title}</strong> has been updated to <strong>${status}</strong>.</p>`
+    });
+
+    res.json({ complaint });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.assignComplaint = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { assignedTo } = req.body; // user id of authority/officer
+    const complaint = await Complaint.findById(id);
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
+
+    const user = await User.findById(assignedTo);
+    if (!user) return res.status(404).json({ message: 'Assigned user not found' });
+
+    complaint.assignedTo = user._id;
+    complaint.status = complaint.status === 'Pending' ? 'In Progress' : complaint.status;
+    await complaint.save();
+
+    // notify assignee
+    await notifyUser(user._id, {
+      title: `New assignment: ${complaint.title}`,
+      message: `You have been assigned complaint ID ${complaint._id}.`
+    });
+
+    res.json({ complaint });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.addComment = async (req, res, next) => {
+  try {
+    const { id } = req.params; // complaint id
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ message: 'Message required' });
+
+    const complaint = await Complaint.findById(id);
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
+
+    complaint.comments.push({ by: req.user._id, message });
+    await complaint.save();
+
+    // notify owner about new comment
+    await notifyUser(complaint.createdBy, {
+      title: `Comment on your complaint "${complaint.title}"`,
+      message: message
+    });
+
+    res.json({ complaint });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+const generateToken = (user) => {
+  return jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+  });
+};
+
+exports.register = async (req, res, next) => {
+  try {
+    const { name, email, password, role } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ message: 'Name, email and password are required' });
+
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(400).json({ message: 'User already exists' });
+
+    const user = new User({ name, email, password, role: role || 'citizen' });
+    await user.save();
+
+    const token = generateToken(user);
+    res.status(201).json({
+      user: { id: user._id, name: user.name, email: user.email, role: user.role },
+      token
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.login = async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
+
+    const user = await User.findOne({ email }).select('+password');
+    if (!user) return res.status(401).json({ message: 'Invalid credentials' });
+
+    const matched = await user.matchPassword(password);
+    if (!matched) return res.status(401).json({ message: 'Invalid credentials' });
+
+    const token = generateToken(user);
+    res.json({
+      user: { id: user._id, name: user.name, email: user.email, role: user.role },
+      token
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// For saving push subscription from frontend
+exports.savePushSubscription = async (req, res, next) => {
+  try {
+    const { subscription } = req.body;
+    const user = req.user;
+    if (!subscription) return res.status(400).json({ message: 'Subscription required' });
+    user.pushSubscription = subscription;
+    await user.save();
+    res.json({ message: 'Subscription saved' });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+
+const Complaint = require('../models/Complaint');
+
+/**
+ * Simple rule-based chatbot endpoint.
+ * POST /api/chatbot/query
+ * body: { q: "What's the status of my complaint 64a..." }
+ *
+ * It tries to detect a complaint id (ObjectId), or email + title words, or asks for help.
+ */
+exports.query = async (req, res, next) => {
+  try {
+    const { q } = req.body;
+    if (!q) return res.status(400).json({ message: 'Query text required in "q"' });
+
+    // Try to find an ObjectId inside q
+    const idMatch = q.match(/[0-9a-fA-F]{24}/);
+    if (idMatch) {
+      const complaint = await Complaint.findById(idMatch[0]).populate('createdBy', 'name email');
+      if (!complaint) return res.json({ reply: `I couldn't find a complaint with id ${idMatch[0]}.` });
+      return res.json({
+        reply: `Complaint "${complaint.title}" is currently "${complaint.status}". Created on ${complaint.createdAt.toDateString()}.`,
+        complaint
+      });
+    }
+
+    // Look for keywords like "status" and "my complaint" and try to find most recent complaint of the user (if authenticated)
+    if (/(status|where|progress)/i.test(q) && req.user) {
+      const complaint = await Complaint.findOne({ createdBy: req.user._id }).sort({ createdAt: -1 });
+      if (!complaint) return res.json({ reply: "I couldn't find any complaints by you." });
+      return res.json({ reply: `Your most recent complaint "${complaint.title}" is "${complaint.status}".`, complaint });
+    }
+
+    // Generic responses
+    if (/how to report|report a (complaint|issue)/i.test(q)) {
+      return res.json({ reply: 'To report an issue, go to /api/complaints (POST). Provide a title, description, category, location (latitude+longitude or address) and optionally photos. You must be authenticated.' });
+    }
+
+    return res.json({ reply: "Sorry, I didn't understand. You can ask: 'What's the status of my complaint <complaint-id>' or 'How to report an issue'." });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+const Complaint = require('../models/Complaint');
+const { notifyUser } = require('../utils/notifier');
+
+/**
+ * Create a complaint
+ * photos are uploaded via multipart/form-data under field name "photos"
+ * expected body: title, description, category, location: { address, latitude, longitude }
+ */
+exports.createComplaint = async (req, res, next) => {
+  try {
+    const { title, description, category, address, latitude, longitude } = req.body;
+    const photos = (req.files || []).map(f => `/uploads/${f.filename}`);
+
+    if (!title) return res.status(400).json({ message: 'Title is required' });
+
+    const complaint = new Complaint({
+      title,
+      description,
+      category: category || 'general',
+      photos,
+      location: { address, latitude: latitude ? Number(latitude) : undefined, longitude: longitude ? Number(longitude) : undefined },
+      createdBy: req.user._id
+    });
+
+    await complaint.save();
+
+    // notify admin/authority? Here we can send notifications to admin role — for simplicity we skip broadcasting.
+    res.status(201).json({ complaint });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getMyComplaints = async (req, res, next) => {
+  try {
+    const complaints = await Complaint.find({ createdBy: req.user._id }).sort({ createdAt: -1 });
+    res.json({ complaints });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getComplaintById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const complaint = await Complaint.findById(id).populate('createdBy', 'name email').populate('assignedTo', 'name email');
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
+    res.json({ complaint });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.searchComplaintsPublic = async (req, res, next) => {
+  try {
+    // public endpoint to show complaints; can filter by status/resolved
+    const { status, category, lat, lng, radiusKm, page = 1, limit = 20 } = req.query;
+    const q = {};
+    if (status) q.status = status;
+    if (category) q.category = category;
+
+    // Basic geofilter (very simple): if lat/lng provided, filter by bounding box ~ radiusKm
+    if (lat && lng && radiusKm) {
+      const latNum = Number(lat);
+      const lngNum = Number(lng);
+      const km = Number(radiusKm);
+      // 1 degree lat ~= 111 km, 1 degree lon ~= 111*cos(lat)
+      const latDelta = km / 111;
+      const lngDelta = km / (111 * Math.cos(latNum * (Math.PI / 180)));
+      q['location.latitude'] = { $gte: latNum - latDelta, $lte: latNum + latDelta };
+      q['location.longitude'] = { $gte: lngNum - lngDelta, $lte: lngNum + lngDelta };
+    }
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const complaints = await Complaint.find(q).sort({ createdAt: -1 }).skip(skip).limit(Number(limit));
+    res.json({ complaints });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+const protect = async (req, res, next) => {
+  try {
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (req.cookies && req.cookies.token) {
+      token = req.cookies.token;
+    }
+
+    if (!token) {
+      return res.status(401).json({ message: 'Not authorized, token missing' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+    if (!user) return res.status(401).json({ message: 'User not found' });
+
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error('auth error', err);
+    return res.status(401).json({ message: 'Not authorized, token failed' });
+  }
+};
+
+module.exports = { protect };
+
+
+const notFound = (req, res, next) => {
+  res.status(404).json({ message: `Not Found - ${req.originalUrl}` });
+};
+
+const errorHandler = (err, req, res, next) => {
+  console.error(err.stack);
+  const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  res.status(statusCode).json({
+    message: err.message || 'Internal Server Error',
+    stack: process.env.NODE_ENV === 'production' ? '🥞' : err.stack
+  });
+};
+
+module.exports = { notFound, errorHandler };
+
+
+
+
+
+const permit = (...allowedRoles) => {
+  return (req, res, next) => {
+    const { user } = req;
+    if (!user) return res.status(401).json({ message: 'Not authenticated' });
+    if (!allowedRoles.includes(user.role)) {
+      return res.status(403).json({ message: 'Forbidden: insufficient permissions' });
+    }
+    next();
+  };
+};
+
+module.exports = { permit };
+
+
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+// ensure uploads dir exists
+const uploadDir = path.join(__dirname, '..', 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const ext = path.extname(file.originalname);
+    const name = file.fieldname + '-' + Date.now() + '-' + Math.round(Math.random() * 1E9) + ext;
+    cb(null, name);
+  }
+});
+
+const fileFilter = (req, file, cb) => {
+  const allowed = /jpeg|jpg|png/;
+  const ext = allowed.test(path.extname(file.originalname).toLowerCase());
+  const mime = allowed.test(file.mimetype);
+  if (ext && mime) cb(null, true);
+  else cb(new Error('Only images are allowed (jpeg, jpg, png)'));
+};
+
+const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+
+module.exports = upload;
+
+
+
+const mongoose = require('mongoose');
+
+const complaintSchema = new mongoose.Schema({
+  title: { type: String, required: true, trim: true },
+  description: { type: String, required: false, trim: true },
+  photos: [{ type: String }], // store file paths or URLs
+  location: {
+    address: { type: String },
+    latitude: { type: Number },
+    longitude: { type: Number }
+  },
+  category: { type: String, default: 'general' }, // e.g. pothole, garbage, streetlight
+  status: { type: String, enum: ['Pending', 'In Progress', 'Resolved', 'Rejected'], default: 'Pending' },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  comments: [{
+    by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    message: { type: String },
+    createdAt: { type: Date, default: Date.now }
+  }],
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+  // optional: resolution notes or evidence photos
+  resolutionNotes: { type: String },
+  resolutionPhotos: [{ type: String }]
+});
+
+complaintSchema.pre('save', function (next) {
+  this.updatedAt = Date.now();
+  next();
+});
+
+module.exports = mongoose.model('Complaint', complaintSchema);
+
+
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password: { type: String, required: true, select: false },
+  role: { type: String, enum: ['citizen', 'authority', 'admin'], default: 'citizen' },
+  createdAt: { type: Date, default: Date.now },
+  // Optionally store push subscription for web push
+  pushSubscription: { type: Object }
+});
+
+// Hash password before save
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
+  next();
+});
+
+userSchema.methods.matchPassword = async function (enteredPassword) {
+  return await bcrypt.compare(enteredPassword, this.password);
+};
+
+module.exports = mongoose.model('User', userSchema);
+
+
+
+const express = require('express');
+const { body } = require('express-validator');
+const router = express.Router();
+const { protect } = require('../middlewares/authMiddleware');
+const upload = require('../middlewares/uploadMiddleware');
+const complaintController = require('../controllers/complaintController');
+const { handleValidation } = require('../utils/validators');
+
+// create complaint (authenticated) - photos optional (field name 'photos')
+router.post('/',
+  protect,
+  upload.array('photos', 5),
+  [
+    body('title').notEmpty().withMessage('Title required'),
+  ],
+  handleValidation,
+  complaintController.createComplaint
+);
+
+// get complaints of current user
+router.get('/mine', protect, complaintController.getMyComplaints);
+
+// public search endpoint
+router.get('/public', complaintController.searchComplaintsPublic);
+
+// get complaint by id
+router.get('/:id', protect, complaintController.getComplaintById);
+
+module.exports = router;
+
+
+const express = require('express');
+const router = express.Router();
+const chatbotController = require('../controllers/chatbotController');
+const { protect } = require('../middlewares/authMiddleware');
+
+// optionally protected: if user authenticates, bot can access their complaints
+router.post('/query', protect, chatbotController.query);
+router.post('/public-query', chatbotController.query); // public fallback
+
+module.exports = router;
+
+
+const express = require('express');
+const { body } = require('express-validator');
+const { handleValidation } = require('../utils/validators');
+const authController = require('../controllers/authController');
+const { protect } = require('../middlewares/authMiddleware');
+
+const router = express.Router();
+
+router.post('/register',
+  [
+    body('name').notEmpty().withMessage('Name required'),
+    body('email').isEmail().withMessage('Valid email required'),
+    body('password').isLength({ min: 6 }).withMessage('Password min 6 chars')
+  ],
+  handleValidation,
+  authController.register
+);
+
+router.post('/login',
+  [
+    body('email').isEmail().withMessage('Valid email required'),
+    body('password').notEmpty().withMessage('Password required')
+  ],
+  handleValidation,
+  authController.login
+);
+
+// Save push subscription (protected)
+router.post('/subscribe', protect, authController.savePushSubscription);
+
+module.exports = router;
+
+
+const express = require('express');
+const { body } = require('express-validator');
+const adminController = require('../controllers/adminController');
+const { protect } = require('../middlewares/authMiddleware');
+const { permit } = require('../middlewares/roleMiddleware');
+const { handleValidation } = require('../utils/validators');
+
+const router = express.Router();
+
+// All routes here require authority or admin
+router.use(protect);
+router.use(permit('authority', 'admin'));
+
+// list complaints with filters
+router.get('/complaints', adminController.listComplaints);
+
+// update status
+router.patch('/complaints/:id/status',
+  [body('status').notEmpty().withMessage('status required')],
+  handleValidation,
+  adminController.updateComplaintStatus
+);
+
+// assign complaint to an officer
+router.patch('/complaints/:id/assign',
+  [body('assignedTo').notEmpty().withMessage('assignedTo user id required')],
+  handleValidation,
+  adminController.assignComplaint
+);
+
+// add comment to complaint
+router.post('/complaints/:id/comment',
+  [body('message').notEmpty().withMessage('message required')],
+  handleValidation,
+  adminController.addComment
+);
+
+module.exports = router;
+
+
+
+const { validationResult } = require('express-validator');
+
+const handleValidation = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({ errors: errors.array() });
+  }
+  next();
+};
+
+module.exports = { handleValidation };
+
+
+const webpush = require('web-push');
+const { sendMail } = require('./mailer');
+const User = require('../models/User');
+
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+}
+
+async function notifyByEmail(email, subject, text, html) {
+  try {
+    if (!email) return;
+    await sendMail({ to: email, subject, text, html });
+  } catch (err) {
+    console.error('Email notify error', err);
+  }
+}
+
+// subscription = user's stored push subscription object
+async function notifyByPush(subscription, payload) {
+  try {
+    if (!subscription || !process.env.VAPID_PUBLIC_KEY) return;
+    await webpush.sendNotification(subscription, JSON.stringify(payload));
+  } catch (err) {
+    console.error('Push notification error', err);
+  }
+}
+
+async function notifyUser(userId, payload) {
+  try {
+    const user = await User.findById(userId);
+    if (!user) return;
+    if (user.email) {
+      await notifyByEmail(user.email, payload.title || 'Update', payload.message || '', payload.html || '');
+    }
+    if (user.pushSubscription) await notifyByPush(user.pushSubscription, payload);
+  } catch (err) {
+    console.error('notifyUser error', err);
+  }
+}
+
+module.exports = { notifyByEmail, notifyByPush, notifyUser };
+
+
+
+const nodemailer = require('nodemailer');
+
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: Number(process.env.SMTP_PORT) === 465, // true for port 465
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+async function sendMail({ to, subject, text, html }) {
+  const from = process.env.EMAIL_FROM;
+  if (!transporter) throw new Error('Mailer not configured');
+  const info = await transporter.sendMail({ from, to, subject, text, html });
+  return info;
+}
+
+module.exports = { sendMail };

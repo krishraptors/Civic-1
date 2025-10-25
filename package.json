@@ -1,0 +1,28 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "- User registration & login (JWT).\r - Citizens can create complaints with photos and location (lat/lng + address).\r - Complaints have statuses: Pending, In Progress, Resolved, Rejected.\r - Admin/Authority endpoints to list, assign, change status, and comment on complaints.\r - Public search API for complaints (supports status, category, simple geofilter).\r - Simple rule-based chatbot endpoint to query complaint status.\r - Email push notification scaffolding (nodemailer).\r - Web-push scaffolding (optional) for browser push notifications.",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "body-parser": "^2.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "express-validator": "^7.3.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.19.2",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.10",
+    "web-push": "^3.6.7"
+  }
+}
