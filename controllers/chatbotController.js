@@ -1,5 +1,9 @@
 const Complaint = require('../models/Complaint');
 
+// import { GoogleGenAI } from "@google/genai";
+
+const GoogleGenAI = require("@google/genai").GoogleGenAI;
+
 /**
  * Simple rule-based chatbot endpoint.
  * POST /api/chatbot/query
@@ -35,8 +39,36 @@ exports.query = async (req, res, next) => {
       return res.json({ reply: 'To report an issue, go to /api/complaints (POST). Provide a title, description, category, location (latitude+longitude or address) and optionally photos. You must be authenticated.' });
     }
 
-    return res.json({ reply: "Sorry, I didn't understand. You can ask: 'What's the status of my complaint <complaint-id>' or 'How to report an issue'." });
+    const geminiResponse = await gemini(q);
+    return res.json({ reply: geminiResponse });
+
+    // return res.json({ reply: "Sorry, I didn't understand. You can ask: 'What's the status of my complaint <complaint-id>' or 'How to report an issue'." });
   } catch (err) {
     next(err);
   }
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+const ai = new GoogleGenAI({});
+
+async function gemini(q) {
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: "Only answer the question if it is related to civic issues. Just repond with 'I am not supposed to answer that', otherwise. Answer the user's query in a concise manner.\nUser query: " + q,
+  });
+  console.log(response.text);
+  return response.text;
+}
+
+// await gemini();
